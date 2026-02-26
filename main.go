@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"html"
 	"os"
 	"time"
 
 	"github.com/ebrahim5801/blog-aggregator/internal/command"
 	"github.com/ebrahim5801/blog-aggregator/internal/config"
 	"github.com/ebrahim5801/blog-aggregator/internal/database"
+	"github.com/ebrahim5801/blog-aggregator/internal/rss"
 	"github.com/ebrahim5801/blog-aggregator/internal/state"
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
@@ -42,6 +44,9 @@ func main() {
 	cmds.Register("register", handlerRegister)
 	cmds.Register("reset", handlerReset)
 	cmds.Register("users", handlerUsers)
+	cmds.Register("agg", handlerRss)
+	cmds.Register("addfeed", handlerAddFeed)
+	cmds.Register("feeds", handlerFeeds)
 
 	cmd := command.Command{
 		Name: os.Args[1],
@@ -126,5 +131,65 @@ func handlerUsers(s *state.State, cmd command.Command) error {
 		fmt.Print("\n")
 	}
 
+	return nil
+}
+
+func handlerRss(s *state.State, cmd command.Command) error {
+	feed, err := rss.FetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+	if err != nil {
+		return err
+	}
+
+	for _, item := range feed.Channel.Item {
+		fmt.Printf("- '%s'\n", html.UnescapeString(item.Title))
+		fmt.Printf("- '%s'\n", html.UnescapeString(item.Description))
+	}
+
+	return nil
+}
+
+func handlerAddFeed(s *state.State, cmd command.Command) error {
+	if len(cmd.Args) == 0 {
+		return fmt.Errorf("please enter username")
+	}
+	if len(cmd.Args) == 1 {
+		return fmt.Errorf("please enter url")
+	}
+	CurrentUserName := s.Config.CurrentUserName
+	user, err := s.Db.GetUser(context.Background(), CurrentUserName)
+	if err != nil {
+		os.Exit(1)
+		return err
+	}
+	data := database.CreateFeedParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Name:      cmd.Args[0],
+		Url:       cmd.Args[1],
+		UserID:    user.ID,
+	}
+	feed, err := s.Db.CreateFeed(context.Background(), data)
+	if err != nil {
+		os.Exit(1)
+		return err
+	}
+
+	fmt.Println(feed)
+	return nil
+}
+
+func handlerFeeds(s *state.State, cmd command.Command) error {
+	feeds, err := s.Db.GetFeeds(context.Background())
+	if err != nil {
+		os.Exit(1)
+		return err
+	}
+	fmt.Println(feeds)
+
+	for _, feed := range feeds {
+		fmt.Println(feed.Name)
+		fmt.Println(feed.UserName)
+	}
 	return nil
 }
