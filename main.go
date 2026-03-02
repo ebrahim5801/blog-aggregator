@@ -40,13 +40,17 @@ func main() {
 	}
 
 	cmds := &command.Commands{}
+
 	cmds.Register("login", handlerLogin)
 	cmds.Register("register", handlerRegister)
 	cmds.Register("reset", handlerReset)
 	cmds.Register("users", handlerUsers)
 	cmds.Register("agg", handlerRss)
-	cmds.Register("addfeed", handlerAddFeed)
 	cmds.Register("feeds", handlerFeeds)
+	cmds.Register("addfeed", middlewareLoggedIn(handlerAddFeed))
+	cmds.Register("follow", middlewareLoggedIn(handlerFollow))
+	cmds.Register("unfollow", middlewareLoggedIn(handlerUnfollow))
+	cmds.Register("following", middlewareLoggedIn(handlerFollowing))
 
 	cmd := command.Command{
 		Name: os.Args[1],
@@ -56,6 +60,23 @@ func main() {
 	if err := cmds.Run(s, cmd); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
+	}
+}
+
+func middlewareLoggedIn(
+	handler func(s *state.State, cmd command.Command, user database.User) error,
+) func(*state.State, command.Command) error {
+	return func(s *state.State, cmd command.Command) error {
+		if s.Config.CurrentUserName == "" {
+			return fmt.Errorf("you must be logged in to use this command")
+		}
+
+		user, err := s.Db.GetUser(context.Background(), s.Config.CurrentUserName)
+		if err != nil {
+			return err
+		}
+
+		return handler(s, cmd, user)
 	}
 }
 
@@ -148,19 +169,11 @@ func handlerRss(s *state.State, cmd command.Command) error {
 	return nil
 }
 
-func handlerAddFeed(s *state.State, cmd command.Command) error {
-	if len(cmd.Args) == 0 {
-		return fmt.Errorf("please enter username")
+func handlerAddFeed(s *state.State, cmd command.Command, user database.User) error {
+	if len(cmd.Args) < 2 {
+		return fmt.Errorf("please enter name and url")
 	}
-	if len(cmd.Args) == 1 {
-		return fmt.Errorf("please enter url")
-	}
-	CurrentUserName := s.Config.CurrentUserName
-	user, err := s.Db.GetUser(context.Background(), CurrentUserName)
-	if err != nil {
-		os.Exit(1)
-		return err
-	}
+
 	data := database.CreateFeedParams{
 		ID:        uuid.New(),
 		CreatedAt: time.Now(),
@@ -169,9 +182,22 @@ func handlerAddFeed(s *state.State, cmd command.Command) error {
 		Url:       cmd.Args[1],
 		UserID:    user.ID,
 	}
+
 	feed, err := s.Db.CreateFeed(context.Background(), data)
 	if err != nil {
-		os.Exit(1)
+		return err
+	}
+
+	followData := database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	}
+
+	_, err = s.Db.CreateFeedFollow(context.Background(), followData)
+	if err != nil {
 		return err
 	}
 
@@ -185,11 +211,72 @@ func handlerFeeds(s *state.State, cmd command.Command) error {
 		os.Exit(1)
 		return err
 	}
-	fmt.Println(feeds)
-
 	for _, feed := range feeds {
 		fmt.Println(feed.Name)
 		fmt.Println(feed.UserName)
 	}
+	return nil
+}
+
+func handlerFollow(s *state.State, cmd command.Command, user database.User) error {
+	if len(cmd.Args) == 0 {
+		return fmt.Errorf("please enter url")
+	}
+
+	feed, err := s.Db.GetFeed(context.Background(), cmd.Args[0])
+	if err != nil {
+		return err
+	}
+
+	data := database.CreateFeedFollowParams{
+		ID:        uuid.New(),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		UserID:    user.ID,
+		FeedID:    feed.ID,
+	}
+
+	_, err = s.Db.CreateFeedFollow(context.Background(), data)
+	if err != nil {
+		return err
+	}
+
+	fmt.Println(feed.Name)
+	return nil
+}
+
+func handlerUnfollow(s *state.State, cmd command.Command, user database.User) error {
+	if len(cmd.Args) == 0 {
+		return fmt.Errorf("please enter url")
+	}
+
+	feed, err := s.Db.GetFeed(context.Background(), cmd.Args[0])
+	if err != nil {
+		return err
+	}
+
+	data := database.DeleteFeedFollowParams{
+		UserID: user.ID,
+		FeedID: feed.ID,
+	}
+
+	err = s.Db.DeleteFeedFollow(context.Background(), data)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func handlerFollowing(s *state.State, cmd command.Command, user database.User) error {
+	feeds, err := s.Db.GetFeedFollowsForUser(context.Background(), user.ID)
+	if err != nil {
+		return err
+	}
+
+	for _, feed := range feeds {
+		fmt.Println(feed.FeedName)
+	}
+
 	return nil
 }
