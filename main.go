@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"html"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ebrahim5801/blog-aggregator/internal/command"
@@ -47,6 +49,7 @@ func main() {
 	cmds.Register("users", handlerUsers)
 	cmds.Register("agg", handlerRss)
 	cmds.Register("feeds", handlerFeeds)
+	cmds.Register("browse", middlewareLoggedIn(handlerBrowse))
 	cmds.Register("addfeed", middlewareLoggedIn(handlerAddFeed))
 	cmds.Register("follow", middlewareLoggedIn(handlerFollow))
 	cmds.Register("unfollow", middlewareLoggedIn(handlerUnfollow))
@@ -156,14 +159,117 @@ func handlerUsers(s *state.State, cmd command.Command) error {
 }
 
 func handlerRss(s *state.State, cmd command.Command) error {
-	feed, err := rss.FetchFeed(context.Background(), "https://www.wagslane.dev/index.xml")
+	if len(cmd.Args) == 0 {
+		return fmt.Errorf("usage: agg <time_between_reqs>")
+	}
+
+	timeBetweenRequests, err := time.ParseDuration(cmd.Args[0])
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", cmd.Args[0], err)
+	}
+
+	fmt.Printf("Collecting feeds every %s\n", timeBetweenRequests)
+
+	ticker := time.NewTicker(timeBetweenRequests)
+	for ; ; <-ticker.C {
+		scrapeFeeds(s)
+	}
+}
+
+var pubDateFormats = []string{
+	time.RFC1123Z,
+	time.RFC1123,
+	time.RFC3339,
+	"Mon, 2 Jan 2006 15:04:05 -0700",
+	"Mon, 2 Jan 2006 15:04:05 MST",
+	"2006-01-02T15:04:05Z",
+	"2006-01-02",
+}
+
+func parsePubDate(s string) sql.NullTime {
+	s = strings.TrimSpace(s)
+	for _, layout := range pubDateFormats {
+		if t, err := time.Parse(layout, s); err == nil {
+			return sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	return sql.NullTime{}
+}
+
+func scrapeFeeds(s *state.State) {
+	feed, err := s.Db.GetNextFeedToFetch(context.Background())
+	if err != nil {
+		fmt.Println("error fetching next feed:", err)
+		return
+	}
+
+	err = s.Db.MarkFeedFetched(context.Background(), feed.ID)
+	if err != nil {
+		fmt.Println("error marking feed fetched:", err)
+		return
+	}
+
+	rssFeed, err := rss.FetchFeed(context.Background(), feed.Url)
+	if err != nil {
+		fmt.Println("error fetching feed:", err)
+		return
+	}
+
+	fmt.Printf("Fetching feed: %s\n", feed.Name)
+	for _, item := range rssFeed.Channel.Item {
+		title := html.UnescapeString(item.Title)
+		desc := sql.NullString{}
+		if item.Description != "" {
+			desc = sql.NullString{String: html.UnescapeString(item.Description), Valid: true}
+		}
+
+		_, err := s.Db.CreatePost(context.Background(), database.CreatePostParams{
+			ID:          uuid.New(),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
+			Title:       title,
+			Url:         item.Link,
+			Description: desc,
+			PublishedAt: parsePubDate(item.PubDate),
+			FeedID:      feed.ID,
+		})
+		if err != nil {
+			if strings.Contains(err.Error(), "unique constraint") || strings.Contains(err.Error(), "duplicate key") {
+				continue
+			}
+			fmt.Println("error saving post:", err)
+		}
+	}
+}
+
+func handlerBrowse(s *state.State, cmd command.Command, user database.User) error {
+	limit := int32(2)
+	if len(cmd.Args) > 0 {
+		n, err := strconv.Atoi(cmd.Args[0])
+		if err != nil {
+			return fmt.Errorf("invalid limit %q", cmd.Args[0])
+		}
+		limit = int32(n)
+	}
+
+	posts, err := s.Db.GetPostsForUser(context.Background(), database.GetPostsForUserParams{
+		UserID: user.ID,
+		Limit:  limit,
+	})
 	if err != nil {
 		return err
 	}
 
-	for _, item := range feed.Channel.Item {
-		fmt.Printf("- '%s'\n", html.UnescapeString(item.Title))
-		fmt.Printf("- '%s'\n", html.UnescapeString(item.Description))
+	for _, post := range posts {
+		fmt.Printf("Title: %s\n", post.Title)
+		fmt.Printf("URL:   %s\n", post.Url)
+		if post.PublishedAt.Valid {
+			fmt.Printf("Date:  %s\n", post.PublishedAt.Time.Format("2006-01-02"))
+		}
+		if post.Description.Valid && post.Description.String != "" {
+			fmt.Printf("Desc:  %s\n", post.Description.String)
+		}
+		fmt.Println("---")
 	}
 
 	return nil
